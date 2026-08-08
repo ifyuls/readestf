@@ -1,0 +1,320 @@
+name: Sync Upstream & Build
+
+on:
+  schedule:
+    - cron: '0 6 * * *'      # 每天 14:00 北京时间
+  workflow_dispatch:          # 手动触发
+
+permissions:
+  contents: write
+
+jobs:
+  # ═══════════════════════════════════════════════════════════
+  # 第一步：检测上游更新 → 打补丁 → push 回 fork
+  # ═══════════════════════════════════════════════════════════
+  sync:
+    runs-on: ubuntu-latest
+    outputs:
+      has_updates: ${{ steps.sync.outputs.has_updates }}
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Add upstream and fetch
+        run: |
+          git remote add upstream https://github.com/readest/readest.git
+          git fetch upstream main
+
+      - name: Sync and patch
+        id: sync
+        run: |
+          set -euo pipefail
+
+          # 检查是否已经打过补丁
+          PATCHED=false
+          if git log --oneline -10 | grep -q "auto: ungate cloud sync"; then
+            PATCHED=true
+          fi
+
+          # 如果已打过补丁，检查上游是否有新提交
+          if [ "$PATCHED" = true ]; then
+            OUR_BASE=$(git rev-parse HEAD~1)
+            UPSTREAM=$(git rev-parse upstream/main)
+            if [ "$UPSTREAM" = "$OUR_BASE" ]; then
+              echo "has_updates=false" >> "$GITHUB_OUTPUT"
+              echo "Already up to date with upstream."
+              exit 0
+            fi
+            echo "Upstream has new commits. Syncing..."
+          else
+            echo "First run — applying patches..."
+          fi
+          echo "has_updates=true" >> "$GITHUB_OUTPUT"
+
+          # 保存 fork 独有的文件（reset 会被上游覆盖）
+          cp apps/readest-app/release.jks /tmp/release.jks 2>/dev/null || true
+          cp .github/workflows/sync-and-build.yml /tmp/sync-and-build.yml
+
+          # 重置到上游 main
+          git reset --hard upstream/main
+
+          # 恢复 fork 独有的 workflow
+          cp /tmp/sync-and-build.yml .github/workflows/sync-and-build.yml
+
+          # ── 打补丁 ──
+
+          # 1. 开放 WebDAV / Google Drive / S3 云同步
+          sed -i 's/CLOUD_SYNC_REQUIRES_PREMIUM = true/CLOUD_SYNC_REQUIRES_PREMIUM = false/' \
+            apps/readest-app/src/utils/access.ts
+
+          # 2. 移除 updater 插件（fork 没有签名密钥，pubkey 会导致构建失败）
+          jq '.bundle.createUpdaterArtifacts = false | del(.plugins.updater)' \
+            apps/readest-app/src-tauri/tauri.conf.json > tmp.json \
+            && mv tmp.json apps/readest-app/src-tauri/tauri.conf.json
+
+          # 3. 删除上游 workflows，避免 fork 中无意义的 CI 失败
+          rm -f .github/workflows/android-e2e.yml
+          rm -f .github/workflows/codeql.yml
+          rm -f .github/workflows/docker-image.yml
+          rm -f .github/workflows/nightly.yml
+          rm -f .github/workflows/pull-request.yml
+          rm -f .github/workflows/release.yml
+          rm -f .github/workflows/scorecard.yml
+          rm -f .github/workflows/upload-to-r2.yml
+          rm -f .github/workflows/vercel-merge.yml
+
+          # 4. 恢复或生成 Android keystore
+          if [ -f /tmp/release.jks ]; then
+            mkdir -p apps/readest-app
+            cp /tmp/release.jks apps/readest-app/release.jks
+            echo "Restored existing keystore."
+          else
+            keytool -genkeypair -v \
+              -keystore apps/readest-app/release.jks \
+              -alias readest \
+              -keyalg RSA -keysize 2048 -validity 36500 \
+              -storepass 123456 -keypass 123456 \
+              -dname "CN=Readest, OU=Personal, O=Personal, L=Unknown, S=Unknown, C=UN"
+            cp apps/readest-app/release.jks /tmp/release.jks
+            echo "Generated new keystore."
+          fi
+
+          # ── 提交并推送 ──
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "auto: ungate cloud sync for WebDAV/GDrive/S3" || true
+          git push origin main --force
+          echo "Pushed patched commit to fork."
+
+      - name: Get version
+        id: version
+        run: |
+          cd apps/readest-app
+          echo "version=$(node -p "require('./package.json').version")" >> "$GITHUB_OUTPUT"
+
+  # ═══════════════════════════════════════════════════════════
+  # 第二步：构建 Windows（x64 + arm64）
+  # ═══════════════════════════════════════════════════════════
+  build-windows:
+    needs: sync
+    if: needs.sync.outputs.has_updates == 'true'
+    runs-on: windows-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            target: x86_64-pc-windows-msvc
+            suffix: x64
+          - arch: aarch64
+            target: aarch64-pc-windows-msvc
+            suffix: arm64
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: 'true'
+
+      - uses: pnpm/action-setup@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          cache: 'pnpm'
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install dependencies
+        run: |
+          pnpm install --frozen-lockfile --prefer-offline
+          pnpm --filter @readest/readest-app setup-vendors
+
+      - name: Build Windows installer
+        working-directory: apps/readest-app
+        run: |
+          echo "NEXT_PUBLIC_APP_PLATFORM=tauri" >> .env.local
+          pnpm tauri build --target ${{ matrix.target }} --bundles nsis
+
+      - name: Upload installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: Readest_${{ needs.sync.outputs.version }}_${{ matrix.suffix }}-setup
+          path: apps/readest-app/target/${{ matrix.target }}/release/bundle/nsis/*.exe
+
+      - name: Build portable binary
+        working-directory: apps/readest-app
+        run: |
+          echo "NEXT_PUBLIC_PORTABLE_APP=true" >> .env.local
+          pnpm tauri build --target ${{ matrix.target }} --bundles nsis
+
+      - name: Upload portable
+        shell: bash
+        run: |
+          # Cargo workspace → target/ lives at repo root, not under src-tauri/
+          RELEASE_DIR="target/${{ matrix.target }}/release"
+          VERSION="${{ needs.sync.outputs.version }}"
+          SUFFIX="${{ matrix.suffix }}"
+          PORTABLE_NAME="Readest_${VERSION}_${SUFFIX}-portable.exe"
+
+          BIN=""
+          for candidate in "$RELEASE_DIR/readest.exe" "$RELEASE_DIR/Readest.exe"; do
+            if [ -f "$candidate" ]; then
+              BIN="$candidate"
+              break
+            fi
+          done
+          if [ -z "$BIN" ]; then
+            echo "::error::Binary not found in $RELEASE_DIR"
+            ls "$RELEASE_DIR"/*.exe 2>/dev/null || echo "(no .exe files found)"
+            exit 1
+          fi
+          cp "$BIN" "$PORTABLE_NAME"
+          echo "Copied $(basename "$BIN") → $PORTABLE_NAME"
+          echo "portable_name=${PORTABLE_NAME}" >> "$GITHUB_ENV"
+
+      - name: Upload portable artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Readest_${{ needs.sync.outputs.version }}_${{ matrix.suffix }}-portable
+          path: ${{ env.portable_name }}
+
+  # ═══════════════════════════════════════════════════════════
+  # 第三步：构建 Android（universal + arm64）
+  # ═══════════════════════════════════════════════════════════
+  build-android:
+    needs: sync
+    if: needs.sync.outputs.has_updates == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: 'true'
+
+      - uses: pnpm/action-setup@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          cache: 'pnpm'
+
+      - uses: actions/setup-java@v5
+        with:
+          distribution: 'zulu'
+          java-version: '17'
+
+      - uses: android-actions/setup-android@v4
+
+      - name: Install NDK
+        run: sdkmanager "ndk;28.2.13676358"
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: >-
+            aarch64-linux-android,armv7-linux-androideabi,
+            i686-linux-android,x86_64-linux-android
+
+      - name: Install dependencies
+        run: |
+          pnpm install --frozen-lockfile --prefer-offline
+          pnpm --filter @readest/readest-app setup-vendors
+
+      - name: Prepare Android project
+        working-directory: apps/readest-app
+        run: |
+          echo "NEXT_PUBLIC_APP_PLATFORM=tauri" >> .env.local
+          rm -rf src-tauri/gen/android
+          pnpm tauri android init
+          pnpm tauri icon ../../data/icons/readest-book.png
+          git checkout .
+
+          # 写入签名配置（keystore 由 sync job 生成并提交到仓库）
+          pushd src-tauri/gen/android
+          echo "keyAlias=readest" > keystore.properties
+          echo "password=123456" >> keystore.properties
+          cp ../../../release.jks ./release.jks
+          echo "storeFile=$PWD/release.jks" >> keystore.properties
+          popd
+
+      - name: Build Android (universal)
+        working-directory: apps/readest-app
+        run: |
+          export NDK_HOME="${ANDROID_HOME}/ndk/28.2.13676358"
+          pnpm tauri android build
+          VERSION=$(node -p "require('./package.json').version")
+          cp src-tauri/gen/android/app/build/outputs/apk/universal/release/app-universal-release.apk \
+            "../../Readest_${VERSION}_universal.apk"
+
+      - name: Build Android (arm64 only)
+        working-directory: apps/readest-app
+        run: |
+          export NDK_HOME="${ANDROID_HOME}/ndk/28.2.13676358"
+          pnpm tauri android build -t aarch64
+          VERSION=$(node -p "require('./package.json').version")
+          cp src-tauri/gen/android/app/build/outputs/apk/universal/release/app-universal-release.apk \
+            "../../Readest_${VERSION}_arm64.apk"
+
+      - name: Upload APKs
+        uses: actions/upload-artifact@v4
+        with:
+          name: Readest_${{ needs.sync.outputs.version }}_android
+          path: |
+            Readest_*_universal.apk
+            Readest_*_arm64.apk
+
+  # ═══════════════════════════════════════════════════════════
+  # 第四步：创建 GitHub Release
+  # ═══════════════════════════════════════════════════════════
+  release:
+    needs: [sync, build-windows, build-android]
+    if: needs.sync.outputs.has_updates == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ needs.sync.outputs.version }}
+          name: Readest v${{ needs.sync.outputs.version }}
+          body: |
+            Auto-built from upstream [readest/readest](https://github.com/readest/readest) v${{ needs.sync.outputs.version }}.
+
+            ### Changes from upstream
+            - WebDAV / Google Drive / S3 cloud sync enabled for **free tier**
+
+            ### ⚠️ Notes
+            - **Windows:** Just install and run
+            - **Android:** Enable "Install from unknown apps" before sideloading the APK
+            - Unsigned builds — no automatic updates
+          files: artifacts/**/*
+          generate_release_notes: false
